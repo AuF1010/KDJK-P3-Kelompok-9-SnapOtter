@@ -23,7 +23,6 @@
 
 ## Daftar Isi
 
-
 # Proyek KDJK: Deployment SnapOtter
 
 **Kelompok 9 — Paralel 3**
@@ -45,6 +44,8 @@
 :---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:
 
 ## Sekilas Tentang
+
+[`^ kembali ke atas ^`](#top)
 
 **SnapOtter** merupakan aplikasi web *open-source* dan *self-hosted* yang menyediakan berbagai alat untuk mengolah gambar, video, audio, PDF, dan berkas lainnya melalui browser. Pengguna dapat melakukan konversi, kompresi, pengeditan sederhana, penyimpanan berkas, serta menyusun beberapa proses melalui fitur **Automate**.
 
@@ -69,6 +70,8 @@ Pada antarmuka SnapOtter versi 2.2.0 yang digunakan kelompok, katalog menampilka
 > ![Halaman Tools SnapOtter](screenshots/01-halaman-tools.png)
 
 ## Instalasi
+
+[`^ kembali ke atas ^`](#top)
 
 ### Prasyarat
 
@@ -287,6 +290,8 @@ Hasil pemeriksaan menunjukkan bahwa container SnapOtter, PostgreSQL, dan Redis b
 
 ## Konfigurasi
 
+[`^ kembali ke atas ^`](#top)
+
 ### 1. Menghubungkan Domain ke VPS
 
 Setelah SnapOtter berhasil dijalankan, domain `snapotterlab.web.id` dihubungkan ke VPS melalui pengaturan DNS pada panel Provider.
@@ -358,6 +363,8 @@ Hasil pengujian kelompok menunjukkan **HTTP/2**, **HTTP 200**, dan status aplika
 
 
 ## Maintenance
+
+[`^ kembali ke atas ^`](#top)
 
 Maintenance dilakukan untuk memantau kondisi SnapOtter, mengatasi kendala layanan, serta menjaga data aplikasi agar tetap aman.
 
@@ -479,6 +486,8 @@ Setelah pembaruan selesai, periksa kembali status container dan pastikan aplikas
 
 ## Otomatisasi
 
+[`^ kembali ke atas ^`](#top)
+
 Selain instalasi secara manual, `otomatisasi_snapotter.sh` juga dibuat untuk mempermudah instalasi dan pengelolaan SnapOtter pada VPS Ubuntu 24.04.
 
 Skrip ini mengotomatisasi pemasangan Docker, pengunduhan berkas konfigurasi SnapOtter, pembuatan password, penyesuaian sumber daya VPS, menjalankan container, serta konfigurasi Caddy untuk akses HTTPS.
@@ -503,6 +512,8 @@ bash otomatisasi_snapotter.sh backup-db
 
 
 ## Cara Pemakaian
+
+[`^ kembali ke atas ^`](#top)
 
 ### 1. Login ke SnapOtter
 
@@ -556,6 +567,8 @@ Pada proyek ini, kelompok mencoba fitur Automate menggunakan tools seperti **Com
 
 
 ## Pembahasan
+
+[`^ kembali ke atas ^`](#top)
 
 ### Kelebihan SnapOtter
 
@@ -614,6 +627,8 @@ Aplikasi berhasil diakses melalui domain `snapotterlab.web.id` menggunakan HTTPS
 Meskipun masih ditemukan beberapa kendala pada fitur tertentu, hasil pengujian menunjukkan bahwa SnapOtter dapat digunakan sebagai aplikasi pengolahan file berbasis web yang dijalankan melalui VPS sendiri.
 
 ## Referensi
+
+[`^ kembali ke atas ^`](#top)
 
 1. SnapOtter. [Repository GitHub](https://github.com/snapotter-hq/SnapOtter).
 2. SnapOtter. [Getting Started](https://docs.snapotter.com/guide/getting-started).
