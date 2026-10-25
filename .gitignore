@@ -1,0 +1,21 @@
+# Kredensial & state deployment — JANGAN pernah di-commit
+.env
+.domain
+.image-digest.lock
+.compose.sha256
+
+# Backup (berisi data pengguna / dump database)
+backups/
+*.sql.gz
+*.dump
+*.tar.gz
+
+# Berkas konfigurasi lokal
+compose.minimum.yml
+docker-compose.yml
+
+# Cruft editor / OS
+*.swp
+*.bak
+.DS_Store
+Thumbs.db
