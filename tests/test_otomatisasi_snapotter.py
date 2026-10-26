@@ -1,619 +1,737 @@
-"""Unit tests for PR #2's deployment hardening, using only the standard library.
+"""Unit tests for the hardening changes in otomatisasi_snapotter.sh.
 
-Run explicitly with: python3 -B -m unittest discover -s tests -v
-Requires Bash and the GNU utilities used by otomatisasi_snapotter.sh on Ubuntu.
-Each Bash subprocess has a five-second timeout. No Docker daemon, network,
-sudo privileges, or running deployment is needed.
+Uses only Python's standard library and the script's existing Bash/coreutils
+dependencies. Run explicitly with:
+    python3 -B -m unittest discover -s tests -p 'test_otomatisasi_snapotter.py' -v
 
-The script has no source-only entry point. Load its declarations before the CLI
-dispatcher, then invoke the real functions with command doubles. Only absolute
-host paths for swap/fstab and installer preconditions are redirected to fixtures;
-function logic is preserved. An unknown privileged command fails the test rather
-than reaching the host. All fixtures are removed by TemporaryDirectory.
+Each test runs the production function definitions in a fresh Bash process.
+The CLI dispatcher is excluded, host paths point to temporary fixtures, and
+privileged commands and network access are replaced by strict test doubles.
+No Docker daemon, root access, package installation, or network is needed.
 """
 
 import gzip
 import hashlib
 import os
 from pathlib import Path
+import shutil
+import stat
 import subprocess
-import tarfile
 import tempfile
 import time
 import unittest
 
 
-REPOSITORY = Path(__file__).resolve().parents[1]
-SCRIPT = REPOSITORY / "otomatisasi_snapotter.sh"
-SOURCE, DISPATCHER, _ = SCRIPT.read_text().partition('\nperintah="${1:-}"\n')
-if not DISPATCHER:
-    raise RuntimeError("CLI boundary changed; review the source-only test loader")
+ROOT = Path(__file__).resolve().parents[1]
+SCRIPT = ROOT / "otomatisasi_snapotter.sh"
+BASH = shutil.which("bash")
+COMPOSE_CONTENT = "services:\n  SnapOtter:\n    image: snapotter/snapotter:2.2.0\n"
+DIGEST = "snapotter/snapotter@sha256:" + "a" * 64
+NEW_DIGEST = "snapotter/snapotter@sha256:" + "b" * 64
+SQL = "CREATE TABLE regression (id integer);\nINSERT INTO regression VALUES (1);\n"
+DAY = 24 * 60 * 60
 
 
-DOUBLES = r"""
-PROYEK="$TEST_PROJECT"
-COMPOSE=(compose_double)
-
+# These doubles never delegate sudo or network calls to real executables.
+# Unexpected operations fail rather than silently succeeding.
+DOUBLES = r'''
 record() {
-  {
-    printf '%s' "$1"
-    shift
-    if (( $# )); then printf ' <%s>' "$@"; fi
-    printf '\n'
-  } >> "$TEST_LOG"
+  printf '%s\t' "$@" >> "$TEST_CALLS"
+  printf '\n' >> "$TEST_CALLS"
 }
 
 unexpected() {
-  printf '%s\n' "$*" >> "$TEST_ROOT/unexpected"
-  printf 'Unexpected external command: %s\n' "$*" >&2
+  printf 'Unexpected test command: %s\n' "$*" >&2
   return 97
 }
 
-# These functions never delegate to the real privileged or network commands.
-sudo() {
-  record sudo "$@"
-  if [[ -n "${MOCK_FAIL_COMMAND:-}" && "$*" == "$MOCK_FAIL_COMMAND" ]]; then
-    return 23
-  fi
-  case "$1 ${2:-} ${3:-}" in
-    'docker compose version') return 0 ;;
-    'docker image inspect')
-      printf '%s' "${MOCK_DIGEST:-}"
-      return "${MOCK_INSPECT_STATUS:-0}" ;;
-    'docker inspect SnapOtter')
-      printf '%s' "${MOCK_VOLUME:-}"
-      return "${MOCK_VOLUME_STATUS:-0}" ;;
-    'docker run --rm')
-      [[ "${MOCK_ARCHIVE_STATUS:-0}" == 0 ]] || return "$MOCK_ARCHIVE_STATUS"
-      local argument archive=''
-      for argument in "$@"; do
-        if [[ "$argument" == /backup/data-*.tar.gz ]]; then
-          archive="$PROYEK/backups/${argument##*/}"
-        fi
-      done
-      [[ -n "$archive" ]] || { unexpected "$@"; return 97; }
-      tar -czf "$archive" -C "$TEST_ROOT/volume" . ;;
-    'chown '*) return "${MOCK_CHOWN_STATUS:-0}" ;;
-    'swapon --show ')
-      printf '%s' "${MOCK_ACTIVE_SWAP:-}"
-      return "${MOCK_SWAP_QUERY_STATUS:-0}" ;;
-    'fallocate -l 2G') return "${MOCK_FALLOCATE_STATUS:-0}" ;;
-    'dd if=/dev/zero '*) return "${MOCK_DD_STATUS:-0}" ;;
-    'chmod 600 '*|'mkswap '*|'swapon '*) return 0 ;;
-    'tee -a '*)
-      [[ "$3" == "$TEST_ROOT/fstab" ]] || { unexpected "$@"; return 97; }
-      cat >> "$TEST_ROOT/fstab" ;;
-    'apt-get install -y'|'ufw allow '*|'ufw default '*|'ufw --force enable'|'ufw status verbose'|'-v  ')
-      return 0 ;;
-    *) unexpected "$@" ;;
-  esac
-}
-
 docker() { unexpected docker "$@"; }
+curl() { unexpected curl "$@"; }
+openssl() { unexpected openssl "$@"; }
 
-compose_double() {
-  record compose "$@"
-  if [[ -n "${MOCK_COMPOSE_FAIL:-}" && "$1" == "$MOCK_COMPOSE_FAIL" ]]; then
-    return 24
+# Make installer preflight checks independent of software on the test host.
+command() {
+  if [[ "${1:-}" == -v && "${2:-}" == caddy ]]; then
+    return 1
   fi
-  case "$1" in
-    config|pull|up|ps) return 0 ;;
-    exec)
-      printf '%s' "$TEST_SQL"
-      return "${MOCK_DUMP_STATUS:-0}" ;;
-    *) unexpected compose "$@" ;;
+  builtin command "$@"
+}
+
+sudo() {
+  record "$@"
+  case "${1:-}" in
+    -v) return 0 ;;
+    docker)
+      case "${2:-}" in
+        compose)
+          shift 2
+          while [[ "${1:-}" == --project-directory || "${1:-}" == --env-file || "${1:-}" == -f ]]; do
+            shift 2
+          done
+          if [[ "$1" == "${FAIL_COMPOSE_ACTION:-}" ]]; then return 43; fi
+          case "$1" in
+            config|version|pull|up|ps) return 0 ;;
+            exec)
+              printf '%s' "$DUMP_CONTENT"
+              return "${DUMP_STATUS:-0}"
+              ;;
+          esac
+          ;;
+        image)
+          [[ "${3:-}" == inspect ]] || { unexpected docker "$@"; return 97; }
+          printf '%s' "$FIXTURE_DIGESTS"
+          return "${DIGEST_STATUS:-0}"
+          ;;
+        inspect)
+          printf '%s' "$FIXTURE_VOLUME"
+          return "${VOLUME_INSPECT_STATUS:-0}"
+          ;;
+        run)
+          [[ "${ARCHIVE_STATUS:-0}" == 0 ]] || return "$ARCHIVE_STATUS"
+          local arg
+          for arg in "$@"; do
+            if [[ "$arg" == /backup/data-*.tar.gz ]]; then
+              # Simulate the container writing its archive to the bind mount.
+              printf 'synthetic archive\n' > "$TEST_PROJECT/backups/${arg##*/}"
+              return 0
+            fi
+          done
+          ;;
+      esac
+      ;;
+    swapon)
+      if [[ "${2:-}" == --show ]]; then
+        printf '%s' "${ACTIVE_SWAP:-}"
+        return 0
+      fi
+      return "${SWAPON_STATUS:-0}"
+      ;;
+    fallocate) return "${FALLOCATE_STATUS:-0}" ;;
+    dd) return "${DD_STATUS:-0}" ;;
+    chmod) return 0 ;;
+    mkswap) return "${MKSWAP_STATUS:-0}" ;;
+    chown) return "${CHOWN_STATUS:-0}" ;;
+    tee)
+      [[ "$#" == 3 && "$2" == -a && "$3" == "$TEST_FSTAB" ]] || {
+        unexpected tee "$@"; return 97;
+      }
+      cat >> "$TEST_FSTAB"
+      return 0
+      ;;
+    apt-get) return "${APT_STATUS:-0}" ;;
+    ufw)
+      [[ "$*" != "${FAIL_UFW:-}" ]] || return 43
+      return 0
+      ;;
   esac
+  unexpected sudo "$@"
 }
-
-curl() {
-  record curl "$@"
-  [[ "${MOCK_DOWNLOAD_STATUS:-0}" == 0 ]] || return "$MOCK_DOWNLOAD_STATUS"
-  printf '%s' "$TEST_COMPOSE" > "$PROYEK/docker-compose.yml"
-}
-
-openssl() {
-  [[ "$*" == 'rand -hex 32' ]] || { unexpected openssl "$@"; return 97; }
-  printf '%064d\n' 1
-}
-"""
+'''
 
 
-class DeploymentTestCase(unittest.TestCase):
+class BashFunctionTestCase(unittest.TestCase):
     def setUp(self):
+        self.assertIsNotNone(BASH, "These tests require Bash, as does the script")
         temporary = tempfile.TemporaryDirectory(prefix="snapotter-tests-")
         self.addCleanup(temporary.cleanup)
-        self.root = Path(temporary.name)
-        # Spaces catch missing quoting in project paths and Docker bind mounts.
-        self.project = self.root / "project with spaces"
+        self.sandbox = Path(temporary.name)
+        # Spaces exercise quoting of project, backup, and lock file paths.
+        self.project = self.sandbox / "deployment with spaces"
         self.project.mkdir()
-        self.log = self.root / "commands"
-        self.log.touch()
-        (self.root / "volume").mkdir()
-        (self.root / "volume" / "upload.txt").write_text("synthetic upload\n")
-        (self.root / "volume" / ".metadata").write_text("hidden fixture\n")
-        (self.root / "fstab").write_text("# fixture fstab\n")
-        (self.root / "os-release").write_text('ID=ubuntu\nVERSION_ID="24.04"\n')
-        self.compose = "services:\n  SnapOtter:\n    image: snapotter/snapotter:2.2.0\n"
-        self.sql = "-- synthetic fixture\nCREATE TABLE uploads (id integer);\n"
-        self.env = os.environ.copy()
-        # Do not let a caller's retention or Bash startup hooks affect cases.
-        for name in ("BACKUP_RETENSI_HARI", "BASH_ENV", "ENV", "SHELLOPTS", "BASHOPTS"):
-            self.env.pop(name, None)
-        for name in list(self.env):
-            if name.startswith(("MOCK_", "TEST_")):
-                self.env.pop(name)
-        self.env.update(
-            TEST_ROOT=str(self.root), TEST_PROJECT=str(self.project),
-            TEST_LOG=str(self.log), TEST_SQL=self.sql, TEST_COMPOSE=self.compose,
-            LC_ALL="C",
-        )
+        self.calls_file = self.sandbox / "calls.tsv"
+        self.calls_file.touch()
+        self.fstab = self.sandbox / "fstab"
+        self.fstab.write_text("# synthetic fstab\n", encoding="utf-8")
+        self.swapfile = self.sandbox / "swapfile"
+        release = self.sandbox / "os-release"
+        release.write_text('ID=ubuntu\nVERSION_ID="24.04"\n', encoding="utf-8")
 
-    def run_bash(self, body, *, status=0, **environment):
-        source = SOURCE
-        for original, fixture in (
-            ("/swapfile", "swapfile"),
-            ("/etc/fstab", "fstab"),
-            ("/etc/os-release", "os-release"),
-            ("/etc/apt/sources.list.d/docker.sources", "docker.sources"),
-        ):
-            source = source.replace(original, str(self.root / fixture))
+        source = SCRIPT.read_text(encoding="utf-8")
+        marker = '\nperintah="${1:-}"\n'
+        self.assertEqual(source.count(marker), 1, "CLI boundary changed; update the test loader")
+        self.library = source.split(marker, 1)[0]
+        # Change only configuration paths; execute the original function bodies.
+        replacements = {
+            'PROYEK="$HOME/snapotter"': 'PROYEK="${TEST_PROJECT:?}"',
+            "/swapfile": str(self.swapfile),
+            "/etc/fstab": str(self.fstab),
+            "/etc/os-release": str(release),
+            "/etc/apt/sources.list.d/docker.sources": str(self.sandbox / "docker.sources"),
+        }
+        for original, replacement in replacements.items():
+            self.assertIn(original, self.library)
+            self.library = self.library.replace(original, replacement)
+
+        # A clean environment also prevents BASH_ENV or exported functions from
+        # injecting host behavior, and makes the default retention deterministic.
+        self.environment = {
+            "PATH": os.defpath,
+            "LANG": "C.UTF-8",
+            "TEST_PROJECT": str(self.project),
+            "TEST_CALLS": str(self.calls_file),
+            "TEST_FSTAB": str(self.fstab),
+            "FIXTURE_DIGESTS": DIGEST + "\n",
+            "FIXTURE_VOLUME": "snapotter_data",
+            "DUMP_CONTENT": SQL,
+        }
+        self.compose_prefix = [
+            "docker", "compose", "--project-directory", str(self.project),
+            "--env-file", str(self.project / ".env"),
+            "-f", str(self.project / "docker-compose.yml"),
+            "-f", str(self.project / "compose.minimum.yml"),
+        ]
+
+    def run_bash(self, body, *, env=None, expected=0):
         result = subprocess.run(
-            ["bash", "--noprofile", "--norc", "-s", "--"],
-            input=source + "\n" + DOUBLES + "\n" + body + "\n",
-            text=True, capture_output=True, cwd=self.root,
-            env={**self.env, **environment}, timeout=5, check=False,
+            [BASH, "--noprofile", "--norc", "-c", self.library + "\n" + DOUBLES + "\n" + body],
+            cwd=self.sandbox,
+            env={**self.environment, **(env or {})},
+            capture_output=True,
+            text=True,
+            timeout=3,
+            check=False,
         )
-        unexpected = self.root / "unexpected"
-        self.assertFalse(
-            unexpected.exists(),
-            unexpected.read_text() if unexpected.exists() else "",
+        self.assertEqual(
+            result.returncode, expected,
+            f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
         )
-        if status is None:
-            self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
-        else:
-            self.assertEqual(result.returncode, status, result.stdout + result.stderr)
         return result
 
     def calls(self):
-        return self.log.read_text().splitlines()
+        return [line.split("\t")[:-1] for line in self.calls_file.read_text().splitlines()]
 
-    def prepare_project(self, *, checksum=True):
-        (self.project / "docker-compose.yml").write_text(self.compose)
-        (self.project / "compose.minimum.yml").write_text("services: {}\n")
-        (self.project / ".env").write_text("# synthetic fixture\n")
+    def compose_calls(self):
+        result = []
+        for call in self.calls():
+            if call[:2] == ["docker", "compose"]:
+                # Preflight probes the Compose plugin before using project flags.
+                if call == ["docker", "compose", "version"]:
+                    result.append(["version"])
+                    continue
+                self.assertEqual(call[:len(self.compose_prefix)], self.compose_prefix)
+                result.append(call[len(self.compose_prefix):])
+        return result
+
+    def seed_compose(self, *, checksum=True):
+        (self.project / "docker-compose.yml").write_text(COMPOSE_CONTENT, encoding="utf-8")
+        (self.project / "compose.minimum.yml").write_text("services: {}\n", encoding="utf-8")
+        (self.project / ".env").write_text("# synthetic credentials\n", encoding="utf-8")
         if checksum:
-            self.lock_compose()
+            digest = hashlib.sha256(COMPOSE_CONTENT.encode()).hexdigest()
+            (self.project / ".compose.sha256").write_text(digest + "\n", encoding="utf-8")
 
-    def lock_compose(self):
-        checksum = hashlib.sha256((self.project / "docker-compose.yml").read_bytes())
-        (self.project / ".compose.sha256").write_text(checksum.hexdigest() + "\n")
-
-    def backup_directory(self):
-        directory = self.project / "backups"
-        directory.mkdir(exist_ok=True)
-        return directory
-
-    def age_file(self, path, days):
-        path.write_text("synthetic old backup\n")
-        stamp = time.time() - days * 86400
-        os.utime(path, (stamp, stamp))
+    def old_backup(self, name="postgres-expired.sql.gz", *, days=40):
+        backups = self.project / "backups"
+        backups.mkdir(exist_ok=True)
+        path = backups / name
+        path.write_bytes(b"synthetic old backup")
+        modified = time.time() - days * DAY
+        os.utime(path, (modified, modified))
         return path
 
 
-class ComposeIntegrityTests(DeploymentTestCase):
+class ComposeIntegrityTests(BashFunctionTestCase):
     def test_legacy_deployment_without_checksum_is_accepted(self):
-        self.prepare_project(checksum=False)
-        self.run_bash("verifikasi_compose")
+        self.seed_compose(checksum=False)
+        self.run_bash("periksa_proyek")
         self.assertFalse((self.project / ".compose.sha256").exists())
+        self.assertEqual(self.compose_calls(), [["version"]])
 
     def test_matching_checksum_is_accepted_without_rewriting_lock(self):
-        self.prepare_project()
+        self.seed_compose()
         lock = self.project / ".compose.sha256"
-        before = lock.stat().st_mtime_ns
+        os.utime(lock, (1, 1))
         self.run_bash("verifikasi_compose")
-        self.assertEqual(lock.stat().st_mtime_ns, before)
+        self.assertEqual(lock.stat().st_mtime_ns, 1_000_000_000)
+        self.assertEqual(self.calls(), [])
 
-    def test_modified_compose_is_rejected_and_lock_is_preserved(self):
-        self.prepare_project()
-        lock = (self.project / ".compose.sha256").read_bytes()
-        (self.project / "docker-compose.yml").write_text(self.compose + "# altered\n")
-        result = self.run_bash("verifikasi_compose", status=1)
+    def test_tampered_compose_is_rejected_by_project_preflight(self):
+        self.seed_compose()
+        (self.project / "docker-compose.yml").write_text("services: {unexpected: {}}\n")
+        result = self.run_bash("periksa_proyek", expected=1)
         self.assertIn("Checksum docker-compose.yml tidak cocok", result.stderr)
-        self.assertEqual((self.project / ".compose.sha256").read_bytes(), lock)
+        self.assertEqual(self.compose_calls(), [["version"]])
 
-    def test_empty_or_invalid_checksum_cannot_bypass_verification(self):
-        self.prepare_project()
+    def test_empty_or_malformed_checksum_fails_closed(self):
+        self.seed_compose()
         for checksum in ("", "not-a-sha256\n"):
             with self.subTest(checksum=checksum):
                 (self.project / ".compose.sha256").write_text(checksum)
-                self.run_bash("verifikasi_compose", status=1)
-
-    def test_missing_compose_with_existing_lock_fails(self):
-        (self.project / ".compose.sha256").write_text("0" * 64 + "\n")
-        self.run_bash("verifikasi_compose", status=None)
-
-    def test_project_preflight_applies_integrity_check(self):
-        self.prepare_project()
-        (self.project / "docker-compose.yml").write_text("# tampered\n")
-        self.run_bash("periksa_proyek", status=1)
-        self.assertEqual(self.calls(), ["sudo <docker> <compose> <version>"])
-
-    def test_configuration_records_downloaded_bytes_and_private_checksum(self):
-        self.run_bash("umask 022; buat_konfigurasi example.test")
-        lock = self.project / ".compose.sha256"
-        expected = hashlib.sha256(self.compose.encode()).hexdigest() + "\n"
-        self.assertEqual(lock.read_text(), expected)
-        self.assertEqual(lock.stat().st_mode & 0o777, 0o600)
-        self.assertEqual(self.calls(), [
-            "curl <--proto> <=https> <--tlsv1.2> <-fsSLo> "
-            f"<{self.project}/docker-compose.yml> "
-            "<https://raw.githubusercontent.com/snapotter-hq/SnapOtter/v2.2.0/docker/docker-compose.yml>",
-            "compose <config> <--quiet>",
-        ])
-
-    def test_failed_download_does_not_create_checksum_or_validate(self):
-        self.run_bash("buat_konfigurasi example.test", status=22, MOCK_DOWNLOAD_STATUS="22")
-        self.assertFalse((self.project / ".compose.sha256").exists())
-        self.assertFalse(any(call.startswith("compose") for call in self.calls()))
-
-
-class ImageDigestTests(DeploymentTestCase):
-    digest = "snapotter/snapotter@sha256:" + "a" * 64
-    changed_digest = "snapotter/snapotter@sha256:" + "b" * 64
-
-    def test_first_digest_is_locked_privately_and_only_first_result_is_used(self):
-        self.run_bash(
-            "umask 022; kunci_digest_image",
-            MOCK_DIGEST=self.digest + "\n" + self.changed_digest + "\n",
-        )
-        lock = self.project / ".image-digest.lock"
-        self.assertEqual(lock.read_text(), self.digest + "\n")
-        self.assertEqual(lock.stat().st_mode & 0o777, 0o600)
-        self.assertEqual(self.calls(), [
-            "sudo <docker> <image> <inspect> <--format> "
-            "<{{range .RepoDigests}}{{println .}}{{end}}> <snapotter/snapotter:2.2.0>",
-        ])
-
-    def test_matching_digest_is_silent_and_preserves_lock(self):
-        lock = self.project / ".image-digest.lock"
-        lock.write_text(self.digest + "\n")
-        before = lock.stat().st_mtime_ns
-        result = self.run_bash("kunci_digest_image", MOCK_DIGEST=self.digest + "\n")
-        self.assertEqual(result.stderr, "")
-        self.assertEqual(lock.stat().st_mtime_ns, before)
-
-    def test_changed_digest_warns_with_both_values_without_replacing_lock(self):
-        lock = self.project / ".image-digest.lock"
-        lock.write_text(self.digest + "\n")
-        result = self.run_bash("kunci_digest_image", MOCK_DIGEST=self.changed_digest + "\n")
-        self.assertIn("PERINGATAN: digest image berubah", result.stderr)
-        self.assertIn(self.digest, result.stderr)
-        self.assertIn(self.changed_digest, result.stderr)
-        self.assertEqual(lock.read_text(), self.digest + "\n")
-
-    def test_missing_or_unreadable_digest_is_nonfatal_and_never_locks_empty_value(self):
-        for inspect_status in ("0", "1"):
-            with self.subTest(inspect_status=inspect_status):
-                result = self.run_bash("kunci_digest_image", MOCK_INSPECT_STATUS=inspect_status)
-                self.assertIn("digest image tidak terbaca", result.stderr)
-                self.assertFalse((self.project / ".image-digest.lock").exists())
-
-    def test_unreadable_digest_preserves_existing_lock(self):
-        lock = self.project / ".image-digest.lock"
-        lock.write_text(self.digest + "\n")
-        self.run_bash("kunci_digest_image", MOCK_INSPECT_STATUS="1")
-        self.assertEqual(lock.read_text(), self.digest + "\n")
-
-    def test_launch_locks_digest_after_pull_and_before_start(self):
-        self.prepare_project()
-        self.run_bash("jalankan_container", MOCK_DIGEST=self.digest + "\n")
-        calls = self.calls()
-        self.assertEqual(calls[:2], ["compose <config> <--quiet>", "compose <pull>"])
-        self.assertIn("<image> <inspect>", calls[2])
-        self.assertEqual(calls[3:], ["compose <up> <-d> <--no-build>", "compose <ps>"])
-        self.assertEqual((self.project / ".image-digest.lock").read_text(), self.digest + "\n")
-
-    def test_launch_rejects_tampering_before_any_docker_operation(self):
-        self.prepare_project()
-        (self.project / "docker-compose.yml").write_text("# altered\n")
-        self.run_bash("jalankan_container", status=1)
+                result = self.run_bash("verifikasi_compose", expected=1)
+                self.assertIn("Checksum docker-compose.yml tidak cocok", result.stderr)
         self.assertEqual(self.calls(), [])
 
-    def test_failed_validation_or_pull_prevents_lock_and_start(self):
-        self.prepare_project()
-        for failure in ("config", "pull"):
-            with self.subTest(failure=failure):
-                self.log.write_text("")
-                self.run_bash("jalankan_container", status=24, MOCK_COMPOSE_FAIL=failure)
-                expected = ["compose <config> <--quiet>"]
-                if failure == "pull":
-                    expected.append("compose <pull>")
-                self.assertEqual(self.calls(), expected)
-                self.assertFalse((self.project / ".image-digest.lock").exists())
+    def test_checksum_read_failure_aborts_verification(self):
+        self.seed_compose()
+        self.run_bash("cat() { return 1; }; verifikasi_compose", expected=1)
+        self.assertEqual(self.calls(), [])
 
-    def test_digest_change_warns_but_does_not_block_launch(self):
-        self.prepare_project()
-        (self.project / ".image-digest.lock").write_text(self.digest + "\n")
-        result = self.run_bash("jalankan_container", MOCK_DIGEST=self.changed_digest + "\n")
-        self.assertIn("PERINGATAN", result.stderr)
-        self.assertIn("compose <up> <-d> <--no-build>", self.calls())
+    def test_checksum_calculation_failure_aborts_verification(self):
+        self.seed_compose()
+        self.run_bash("sha256sum() { return 1; }; verifikasi_compose", expected=1)
+        self.assertEqual(self.calls(), [])
 
+    def test_launch_rejects_tampering_before_any_docker_operation(self):
+        self.seed_compose()
+        with (self.project / "docker-compose.yml").open("a") as compose:
+            compose.write("# changed after installation\n")
+        self.run_bash("jalankan_container", expected=1)
+        self.assertEqual(self.calls(), [])
 
-class SwapTests(DeploymentTestCase):
-    def test_active_swap_is_left_untouched(self):
-        self.run_bash("konfigurasi_swap", MOCK_ACTIVE_SWAP="NAME TYPE SIZE USED PRIO\n/dev/zram0 partition 2G 0B 5\n")
-        self.assertEqual(self.calls(), ["sudo <swapon> <--show>"])
-
-    def test_existing_swapfile_is_left_untouched(self):
-        swapfile = self.root / "swapfile"
-        swapfile.write_text("existing swap fixture\n")
-        self.run_bash("konfigurasi_swap")
-        self.assertEqual(self.calls(), ["sudo <swapon> <--show>"])
-        self.assertEqual(swapfile.read_text(), "existing swap fixture\n")
-
-    def test_creates_private_two_gibibyte_swap_before_registering_it(self):
-        self.run_bash("konfigurasi_swap")
-        swapfile = self.root / "swapfile"
-        self.assertEqual(self.calls(), [
-            "sudo <swapon> <--show>",
-            f"sudo <fallocate> <-l> <2G> <{swapfile}>",
-            f"sudo <chmod> <600> <{swapfile}>",
-            f"sudo <mkswap> <{swapfile}>",
-            f"sudo <swapon> <{swapfile}>",
-            f"sudo <tee> <-a> <{self.root}/fstab>",
+    def test_configuration_records_downloaded_content_checksum_privately(self):
+        result = self.run_bash(r'''
+curl() {
+  record curl "$@"
+  [[ "$4" == -fsSLo ]] || return 97
+  printf '%s' "$FIXTURE_COMPOSE" > "$5"
+}
+openssl() { printf '%064d' 0; }
+buat_konfigurasi example.test
+verifikasi_compose
+''', env={"FIXTURE_COMPOSE": COMPOSE_CONTENT})
+        lock = self.project / ".compose.sha256"
+        downloaded = (self.project / "docker-compose.yml").read_bytes()
+        self.assertEqual(lock.read_text(), hashlib.sha256(downloaded).hexdigest() + "\n")
+        self.assertEqual(stat.S_IMODE(lock.stat().st_mode), 0o600)
+        self.assertEqual(self.calls()[0], [
+            "curl", "--proto", "=https", "--tlsv1.2", "-fsSLo",
+            str(self.project / "docker-compose.yml"),
+            "https://raw.githubusercontent.com/snapotter-hq/SnapOtter/v2.2.0/docker/docker-compose.yml",
         ])
-        self.assertEqual((self.root / "fstab").read_text(), f"# fixture fstab\n{swapfile} none swap sw 0 0\n")
+        self.assertEqual(self.compose_calls(), [["config", "--quiet"]])
+        self.assertEqual(result.stderr, "")
 
-    def test_allocation_failure_falls_back_to_dd(self):
-        self.run_bash("konfigurasi_swap", MOCK_FALLOCATE_STATUS="1")
-        self.assertIn(
-            f"sudo <dd> <if=/dev/zero> <of={self.root}/swapfile> <bs=1M> <count=2048>",
-            self.calls(),
-        )
-        self.assertIn(f"sudo <swapon> <{self.root}/swapfile>", self.calls())
+    def test_failed_download_does_not_create_checksum_or_start_containers(self):
+        self.run_bash("curl() { return 22; }; buat_konfigurasi example.test", expected=22)
+        self.assertFalse((self.project / ".compose.sha256").exists())
+        self.assertEqual(self.calls(), [])
 
-    def test_failed_allocators_abort_before_format_or_persistence(self):
-        self.run_bash("konfigurasi_swap", status=2, MOCK_FALLOCATE_STATUS="1", MOCK_DD_STATUS="2")
-        self.assertEqual(len(self.calls()), 3)
-        self.assertEqual((self.root / "fstab").read_text(), "# fixture fstab\n")
+    def test_launch_checks_config_then_pulls_inspects_digest_and_starts(self):
+        self.seed_compose()
+        self.run_bash("jalankan_container")
+        self.assertEqual(self.compose_calls(), [
+            ["config", "--quiet"], ["pull"], ["up", "-d", "--no-build"], ["ps"],
+        ])
+        self.assertEqual([call[:3] for call in self.calls()], [
+            ["docker", "compose", "--project-directory"],
+            ["docker", "compose", "--project-directory"],
+            ["docker", "image", "inspect"],
+            ["docker", "compose", "--project-directory"],
+            ["docker", "compose", "--project-directory"],
+        ])
+        self.assertEqual((self.project / ".image-digest.lock").read_text(), DIGEST + "\n")
 
-    def test_format_or_activation_failure_does_not_persist_swap(self):
-        for command in ("chmod 600", "mkswap", "swapon"):
-            with self.subTest(command=command):
-                self.log.write_text("")
-                self.run_bash(
-                    "konfigurasi_swap", status=23,
-                    MOCK_FAIL_COMMAND=f"{command} {self.root}/swapfile",
-                )
-                self.assertFalse(any("<tee>" in call for call in self.calls()))
-                self.assertEqual((self.root / "fstab").read_text(), "# fixture fstab\n")
+    def test_invalid_compose_stops_before_pull(self):
+        self.seed_compose()
+        self.run_bash("jalankan_container", env={"FAIL_COMPOSE_ACTION": "config"}, expected=43)
+        self.assertEqual(self.compose_calls(), [["config", "--quiet"]])
+        self.assertFalse((self.project / ".image-digest.lock").exists())
+
+    def test_failed_pull_stops_before_digest_recording_or_start(self):
+        self.seed_compose()
+        self.run_bash("jalankan_container", env={"FAIL_COMPOSE_ACTION": "pull"}, expected=43)
+        self.assertEqual(self.compose_calls(), [["config", "--quiet"], ["pull"]])
+        self.assertEqual(len(self.calls()), 2)
+        self.assertFalse((self.project / ".image-digest.lock").exists())
+
+
+class ImageDigestTests(BashFunctionTestCase):
+    def test_first_pull_records_only_first_repo_digest_with_private_permissions(self):
+        result = self.run_bash("kunci_digest_image", env={
+            "FIXTURE_DIGESTS": DIGEST + "\n" + NEW_DIGEST + "\n",
+        })
+        lock = self.project / ".image-digest.lock"
+        self.assertEqual(lock.read_text(), DIGEST + "\n")
+        self.assertEqual(stat.S_IMODE(lock.stat().st_mode), 0o600)
+        self.assertEqual(self.calls(), [[
+            "docker", "image", "inspect", "--format",
+            "{{range .RepoDigests}}{{println .}}{{end}}", "snapotter/snapotter:2.2.0",
+        ]])
+        self.assertIn(DIGEST, result.stdout)
+        self.assertEqual(result.stderr, "")
+
+    def test_same_digest_does_not_warn_or_rewrite_existing_lock(self):
+        lock = self.project / ".image-digest.lock"
+        lock.write_text(DIGEST + "\n")
+        os.utime(lock, (1, 1))
+        result = self.run_bash("kunci_digest_image")
+        self.assertEqual(result.stderr, "")
+        self.assertEqual(lock.read_text(), DIGEST + "\n")
+        self.assertEqual(lock.stat().st_mtime_ns, 1_000_000_000)
+
+    def test_changed_digest_warns_and_preserves_original_lock_but_allows_launch(self):
+        self.seed_compose()
+        lock = self.project / ".image-digest.lock"
+        lock.write_text(DIGEST + "\n")
+        result = self.run_bash("jalankan_container", env={"FIXTURE_DIGESTS": NEW_DIGEST + "\n"})
+        self.assertIn("PERINGATAN: digest image berubah", result.stderr)
+        self.assertIn(DIGEST, result.stderr)
+        self.assertIn(NEW_DIGEST, result.stderr)
+        self.assertEqual(lock.read_text(), DIGEST + "\n")
+        self.assertIn(["up", "-d", "--no-build"], self.compose_calls())
+
+    def test_missing_digest_warns_without_creating_lock(self):
+        result = self.run_bash("kunci_digest_image", env={"FIXTURE_DIGESTS": ""})
+        self.assertIn("digest image tidak terbaca", result.stderr)
+        self.assertFalse((self.project / ".image-digest.lock").exists())
+
+    def test_inspect_failure_is_nonfatal_without_creating_lock(self):
+        result = self.run_bash("kunci_digest_image", env={"FIXTURE_DIGESTS": "", "DIGEST_STATUS": "1"})
+        self.assertIn("digest image tidak terbaca", result.stderr)
+        self.assertFalse((self.project / ".image-digest.lock").exists())
+
+    def test_unreadable_digest_keeps_previous_lock(self):
+        lock = self.project / ".image-digest.lock"
+        lock.write_text(DIGEST + "\n")
+        self.run_bash("kunci_digest_image", env={"FIXTURE_DIGESTS": "", "DIGEST_STATUS": "1"})
+        self.assertEqual(lock.read_text(), DIGEST + "\n")
+
+    def test_digest_lock_write_failure_prevents_container_start(self):
+        self.seed_compose()
+        # A directory at the lock path deterministically rejects file creation,
+        # including when these tests are run by root.
+        (self.project / ".image-digest.lock").mkdir()
+        self.run_bash("jalankan_container", expected=1)
+        self.assertEqual(self.compose_calls(), [["config", "--quiet"], ["pull"]])
+
+    def test_digest_lock_permission_failure_prevents_container_start(self):
+        self.seed_compose()
+        self.run_bash("chmod() { return 1; }; jalankan_container", expected=1)
+        self.assertEqual(self.compose_calls(), [["config", "--quiet"], ["pull"]])
+
+
+class SwapTests(BashFunctionTestCase):
+    def expected_creation_calls(self, *, fallback=False, persist=True):
+        calls = [["swapon", "--show"], ["fallocate", "-l", "2G", str(self.swapfile)]]
+        if fallback:
+            calls.append(["dd", "if=/dev/zero", f"of={self.swapfile}", "bs=1M", "count=2048"])
+        calls.extend([
+            ["chmod", "600", str(self.swapfile)],
+            ["mkswap", str(self.swapfile)],
+            ["swapon", str(self.swapfile)],
+        ])
+        if persist:
+            calls.append(["tee", "-a", str(self.fstab)])
+        return calls
+
+    def test_active_swap_skips_creation_and_fstab_changes(self):
+        before = self.fstab.read_text()
+        self.run_bash("konfigurasi_swap", env={"ACTIVE_SWAP": "NAME TYPE SIZE USED PRIO\n/dev/vda swap 2G 0B -2\n"})
+        self.assertEqual(self.calls(), [["swapon", "--show"]])
+        self.assertEqual(self.fstab.read_text(), before)
+        self.assertFalse(self.swapfile.exists())
+
+    def test_existing_inactive_swapfile_is_preserved(self):
+        self.swapfile.write_bytes(b"existing swap sentinel")
+        before = self.fstab.read_text()
+        self.run_bash("konfigurasi_swap")
+        self.assertEqual(self.calls(), [["swapon", "--show"]])
+        self.assertEqual(self.swapfile.read_bytes(), b"existing swap sentinel")
+        self.assertEqual(self.fstab.read_text(), before)
+
+    def test_new_swap_is_sized_secured_formatted_enabled_and_persisted(self):
+        self.run_bash("konfigurasi_swap")
+        self.assertEqual(self.calls(), self.expected_creation_calls())
+        self.assertEqual(self.fstab.read_text(), f"# synthetic fstab\n{self.swapfile} none swap sw 0 0\n")
+
+    def test_dd_fallback_is_used_if_fallocate_is_unsupported(self):
+        self.run_bash("konfigurasi_swap", env={"FALLOCATE_STATUS": "1"})
+        self.assertEqual(self.calls(), self.expected_creation_calls(fallback=True))
+        self.assertIn(f"{self.swapfile} none swap sw 0 0\n", self.fstab.read_text())
+
+    def test_allocation_failure_stops_before_formatting_or_persisting(self):
+        before = self.fstab.read_text()
+        self.run_bash("konfigurasi_swap", env={"FALLOCATE_STATUS": "1", "DD_STATUS": "1"}, expected=1)
+        self.assertEqual(self.calls(), self.expected_creation_calls(fallback=True)[:3])
+        self.assertEqual(self.fstab.read_text(), before)
 
     def test_existing_fstab_entry_is_not_duplicated(self):
-        for separator in (" ", "\t"):
-            with self.subTest(separator=separator):
-                contents = f"{self.root}/swapfile{separator}none swap sw 0 0\n"
-                (self.root / "fstab").write_text(contents)
-                self.log.write_text("")
-                self.run_bash("konfigurasi_swap")
-                self.assertEqual((self.root / "fstab").read_text(), contents)
-                self.assertFalse(any("<tee>" in call for call in self.calls()))
+        entry = f"{self.swapfile}\tnone swap sw 0 0\n"
+        self.fstab.write_text(entry)
+        self.run_bash("konfigurasi_swap")
+        self.assertEqual(self.calls(), self.expected_creation_calls(persist=False))
+        self.assertEqual(self.fstab.read_text(), entry)
+
+    def test_format_failure_does_not_enable_or_persist_swap(self):
+        before = self.fstab.read_text()
+        self.run_bash("konfigurasi_swap", env={"MKSWAP_STATUS": "1"}, expected=1)
+        self.assertEqual(self.calls(), self.expected_creation_calls()[:4])
+        self.assertEqual(self.fstab.read_text(), before)
+
+    def test_activation_failure_does_not_persist_swap(self):
+        before = self.fstab.read_text()
+        self.run_bash("konfigurasi_swap", env={"SWAPON_STATUS": "1"}, expected=1)
+        self.assertEqual(self.calls(), self.expected_creation_calls(persist=False))
+        self.assertEqual(self.fstab.read_text(), before)
 
 
-class FirewallTests(DeploymentTestCase):
-    def test_ssh_and_web_rules_are_applied_before_noninteractive_enable(self):
+class FirewallTests(BashFunctionTestCase):
+    EXPECTED = [
+        ["apt-get", "install", "-y", "ufw"],
+        ["ufw", "allow", "OpenSSH"],
+        ["ufw", "allow", "80/tcp"],
+        ["ufw", "allow", "443/tcp"],
+        ["ufw", "default", "deny", "incoming"],
+        ["ufw", "default", "allow", "outgoing"],
+        ["ufw", "--force", "enable"],
+        ["ufw", "status", "verbose"],
+    ]
+
+    def test_required_access_and_defaults_are_configured_before_enabling(self):
         self.run_bash("konfigurasi_firewall")
-        self.assertEqual(self.calls(), [
-            "sudo <apt-get> <install> <-y> <ufw>",
-            "sudo <ufw> <allow> <OpenSSH>",
-            "sudo <ufw> <allow> <80/tcp>",
-            "sudo <ufw> <allow> <443/tcp>",
-            "sudo <ufw> <default> <deny> <incoming>",
-            "sudo <ufw> <default> <allow> <outgoing>",
-            "sudo <ufw> <--force> <enable>",
-            "sudo <ufw> <status> <verbose>",
-        ])
+        self.assertEqual(self.calls(), self.EXPECTED)
 
-    def test_install_or_rule_failure_prevents_firewall_enable(self):
-        for command in ("apt-get install -y ufw", "ufw allow OpenSSH", "ufw allow 443/tcp"):
-            with self.subTest(command=command):
-                self.log.write_text("")
-                self.run_bash("konfigurasi_firewall", status=23, MOCK_FAIL_COMMAND=command)
-                self.assertFalse(any("<enable>" in call for call in self.calls()))
+    def test_package_install_failure_does_not_change_firewall(self):
+        self.run_bash("konfigurasi_firewall", env={"APT_STATUS": "100"}, expected=100)
+        self.assertEqual(self.calls(), self.EXPECTED[:1])
 
+    def test_rule_failure_aborts_before_enabling_firewall(self):
+        for index in range(1, 6):
+            with self.subTest(rule=self.EXPECTED[index]):
+                self.calls_file.write_text("")
+                self.run_bash("konfigurasi_firewall", env={
+                    "FAIL_UFW": " ".join(self.EXPECTED[index]),
+                }, expected=43)
+                self.assertEqual(self.calls(), self.EXPECTED[:index + 1])
 
-class BackupTests(DeploymentTestCase):
-    def test_database_and_volume_share_stamp_and_preserve_contents(self):
-        backups = self.backup_directory()
-        old_backup = self.age_file(backups / "postgres-old.sql.gz", 16)
-        self.run_bash("backup_database", MOCK_VOLUME="snapotter_data")
-        databases = list(backups.glob("postgres-*.sql.gz"))
-        archives = list(backups.glob("data-*.tar.gz"))
-        self.assertEqual(len(databases), 1)
-        self.assertEqual(len(archives), 1)
-        stamp = databases[0].name.removeprefix("postgres-").removesuffix(".sql.gz")
-        self.assertRegex(stamp, r"^\d{8}-\d{6}-\d+$")
-        self.assertEqual(archives[0].name, f"data-{stamp}.tar.gz")
-        self.assertEqual(gzip.decompress(databases[0].read_bytes()).decode(), self.sql)
-        with tarfile.open(archives[0]) as archive:
-            self.assertEqual(archive.extractfile("./upload.txt").read(), b"synthetic upload\n")
-            self.assertEqual(archive.extractfile("./.metadata").read(), b"hidden fixture\n")
-        self.assertEqual(backups.stat().st_mode & 0o777, 0o700)
-        self.assertEqual(databases[0].stat().st_mode & 0o777, 0o600)
-        self.assertEqual(list(backups.glob(".db-*")), [])
-        self.assertFalse(old_backup.exists())
-        self.assertEqual(self.calls()[0],
-            'compose <exec> <-T> <postgres> <sh> <-c> <exec pg_dump -U "$POSTGRES_USER" -d "$POSTGRES_DB">')
-        self.assertIn(
-            f"sudo <docker> <run> <--rm> <-v> <snapotter_data:/data:ro> <-v> "
-            f"<{backups}:/backup> <alpine:3.22> <tar> <-czf> </backup/data-{stamp}.tar.gz> <-C> </data> <.>",
-            self.calls(),
-        )
-        self.assertIn(
-            f"sudo <chown> <{os.getuid()}:{os.getgid()}> <{archives[0]}>",
-            self.calls(),
-        )
-
-    def test_dump_failure_removes_partial_file_and_never_archives_or_prunes(self):
-        backups = self.backup_directory()
-        old_backup = self.age_file(backups / "postgres-old.sql.gz", 16)
-        result = self.run_bash("backup_database", status=1, MOCK_DUMP_STATUS="7", MOCK_VOLUME="snapotter_data")
-        self.assertIn("Backup PostgreSQL gagal", result.stderr)
-        self.assertEqual(list(backups.iterdir()), [old_backup])
-        self.assertEqual(len(self.calls()), 1)
-
-    def test_compression_failure_removes_partial_file_and_never_archives(self):
-        result = self.run_bash(
-            "gzip() { cat >/dev/null; return 8; }; backup_database", status=1,
-        )
-        self.assertIn("Backup PostgreSQL gagal", result.stderr)
-        self.assertEqual(list((self.project / "backups").iterdir()), [])
-        self.assertEqual(len(self.calls()), 1)
-
-    def test_missing_or_uninspectable_volume_warns_and_retains_database(self):
-        for inspect_status in ("0", "1"):
-            with self.subTest(inspect_status=inspect_status):
-                self.log.write_text("")
-                result = self.run_bash("backup_database", MOCK_VOLUME_STATUS=inspect_status)
-                self.assertIn("volume /data tidak ditemukan", result.stderr)
-                self.assertTrue(list((self.project / "backups").glob("postgres-*.sql.gz")))
-                self.assertFalse(any("<run>" in call for call in self.calls()))
-
-    def test_volume_failure_is_nonfatal_and_still_prunes_old_backups(self):
-        backups = self.backup_directory()
-        old_backup = self.age_file(backups / "data-old.tar.gz", 16)
-        result = self.run_bash("backup_database", MOCK_VOLUME="snapotter_data", MOCK_ARCHIVE_STATUS="9")
-        self.assertIn("backup volume /data gagal", result.stderr)
-        self.assertEqual(len(list(backups.glob("postgres-*.sql.gz"))), 1)
-        self.assertFalse(old_backup.exists())
-        self.assertFalse(any("<chown>" in call for call in self.calls()))
-
-    def test_volume_ownership_failure_is_nonfatal(self):
-        self.backup_directory()
-        result = self.run_bash('backup_volume "fixed-stamp"', MOCK_VOLUME="snapotter_data", MOCK_CHOWN_STATUS="1")
-        self.assertTrue((self.project / "backups/data-fixed-stamp.tar.gz").exists())
-        self.assertIn("Backup volume /data:", result.stdout)
-        self.assertTrue(any("<chown>" in call for call in self.calls()))
+    def test_enable_failure_stops_before_status_query(self):
+        self.run_bash("konfigurasi_firewall", env={"FAIL_UFW": "ufw --force enable"}, expected=43)
+        self.assertEqual(self.calls(), self.EXPECTED[:-1])
 
 
-class RetentionTests(DeploymentTestCase):
-    def test_retention_defaults_to_fourteen_days_and_accepts_override(self):
-        for environment, expected in (({}, "14"), ({"BACKUP_RETENSI_HARI": ""}, "14"),
-                                      ({"BACKUP_RETENSI_HARI": "30"}, "30"),
-                                      ({"BACKUP_RETENSI_HARI": "0"}, "0")):
-            with self.subTest(environment=environment):
-                result = self.run_bash('printf "%s" "$BACKUP_RETENSI_HARI"', **environment)
-                self.assertEqual(result.stdout, expected)
-
-    def test_only_expired_top_level_backup_files_are_deleted(self):
-        backups = self.backup_directory()
-        expired = [self.age_file(backups / name, 16) for name in ("postgres-old.sql.gz", "data-old.tar.gz")]
-        preserved = [
-            self.age_file(backups / "postgres-recent.sql.gz", 1),
-            self.age_file(backups / "data-recent.tar.gz", 1),
-            self.age_file(backups / "unrelated.sql.gz", 40),
-            self.age_file(backups / ".db-partial", 40),
-            self.age_file(backups / "postgres-old.dump", 40),
-        ]
-        nested = backups / "nested"
-        nested.mkdir()
-        preserved.append(self.age_file(nested / "postgres-old.sql.gz", 40))
-        directory = backups / "data-directory.tar.gz"
-        directory.mkdir()
-        outside = self.age_file(self.root / "outside.sql.gz", 40)
-        link = backups / "postgres-linked.sql.gz"
-        link.symlink_to(outside)
-        old_stamp = time.time() - 40 * 86400
-        os.utime(directory, (old_stamp, old_stamp))
-        os.utime(link, (old_stamp, old_stamp), follow_symlinks=False)
-        result = self.run_bash("prune_backup")
-        for path in expired:
-            self.assertFalse(path.exists())
-            self.assertIn(str(path), result.stdout)
-        for path in preserved + [directory, outside, link]:
-            self.assertTrue(path.exists(), str(path))
-            self.assertNotIn(str(path), result.stdout)
-
-    def test_find_retention_boundary_uses_completed_twenty_four_hour_periods(self):
-        backups = self.backup_directory()
-        # GNU find -mtime +14 deletes when the completed-day count exceeds 14.
-        boundary = self.age_file(backups / "postgres-fourteen.sql.gz", 14.5)
-        expired = self.age_file(backups / "data-fifteen.tar.gz", 15.5)
-        self.run_bash("prune_backup")
-        self.assertTrue(boundary.exists())
-        self.assertFalse(expired.exists())
-
-    def test_custom_retention_reaches_the_pruning_operation(self):
-        backups = self.backup_directory()
-        retained = self.age_file(backups / "postgres-twenty.sql.gz", 20)
-        expired = self.age_file(backups / "data-thirtyone.tar.gz", 31)
-        result = self.run_bash("prune_backup", BACKUP_RETENSI_HARI="30")
-        self.assertTrue(retained.exists())
-        self.assertFalse(expired.exists())
-        self.assertIn(">30 hari", result.stdout)
-
-    def test_nothing_expired_is_silent(self):
-        backups = self.backup_directory()
-        self.age_file(backups / "postgres-recent.sql.gz", 1)
-        result = self.run_bash("prune_backup")
-        self.assertEqual(result.stdout, "")
-
-
-class InstallationWiringTests(DeploymentTestCase):
-    stubs = r"""
-command() {
-  if [[ "$*" == '-v caddy' ]]; then return 1; fi
-  builtin command "$@"
-}
-konfigurasi_swap() { record swap; return "${MOCK_SWAP_STATUS:-0}"; }
-instal_docker() { record install-docker; }
-buat_konfigurasi() { record configuration "$@"; }
-jalankan_container() { record launch; }
-konfigurasi_firewall() { record firewall; return "${MOCK_FIREWALL_STATUS:-0}"; }
+class InstallationOrderTests(BashFunctionTestCase):
+    STAGES = r'''
+konfigurasi_swap() { record swap; return "${SWAP_STAGE_STATUS:-0}"; }
+instal_docker() { record install_docker; }
+buat_konfigurasi() { record configure "$@"; }
+jalankan_container() { record containers; }
+konfigurasi_firewall() { record firewall; return "${FIREWALL_STAGE_STATUS:-0}"; }
 konfigurasi_caddy() { record caddy "$@"; }
 coba_api() { record health "$@"; }
-cek_layanan() { record check; }
-"""
+cek_layanan() { record services; }
+instal_baru example.test
+'''
 
-    def test_installer_sets_up_swap_before_docker_and_firewall_before_https(self):
-        self.run_bash(self.stubs + "\ninstal_baru example.test")
-        calls = self.calls()
-        self.assertEqual(calls[:7], [
-            "sudo <-v>", "swap", "install-docker",
-            "configuration <example.test>", "launch", "firewall",
-            "caddy <example.test>",
+    def test_installation_prepares_swap_and_firewall_at_required_stages(self):
+        self.run_bash(self.STAGES)
+        self.assertEqual(self.calls(), [
+            ["-v"], ["swap"], ["install_docker"], ["configure", "example.test"],
+            ["containers"], ["firewall"], ["caddy", "example.test"],
+            ["health", "http://127.0.0.1:1349/api/v1/health", "API lokal"],
+            ["health", "https://example.test/api/v1/health", "API HTTPS"], ["services"],
         ])
-        self.assertIn("health <http://127.0.0.1:1349/api/v1/health> <API lokal>", calls)
-        self.assertIn("health <https://example.test/api/v1/health> <API HTTPS>", calls)
 
-    def test_failed_hardening_aborts_remaining_installation(self):
-        for environment, expected_last in (({"MOCK_SWAP_STATUS": "5"}, "swap"),
-                                           ({"MOCK_FIREWALL_STATUS": "5"}, "firewall")):
-            with self.subTest(environment=environment):
-                self.log.write_text("")
-                self.run_bash(self.stubs + "\ninstal_baru example.test", status=5, **environment)
-                self.assertEqual(self.calls()[-1], expected_last)
-                self.assertFalse(any(call.startswith("caddy") for call in self.calls()))
+    def test_swap_failure_aborts_before_docker_installation(self):
+        self.run_bash(self.STAGES, env={"SWAP_STAGE_STATUS": "1"}, expected=1)
+        self.assertEqual(self.calls(), [["-v"], ["swap"]])
+
+    def test_firewall_failure_aborts_before_caddy_and_health_checks(self):
+        self.run_bash(self.STAGES, env={"FIREWALL_STAGE_STATUS": "1"}, expected=1)
+        self.assertEqual(self.calls(), [
+            ["-v"], ["swap"], ["install_docker"], ["configure", "example.test"],
+            ["containers"], ["firewall"],
+        ])
 
 
-class DeploymentIgnoreTests(unittest.TestCase):
-    def check_ignore(self, paths, status):
+class BackupTests(BashFunctionTestCase):
+    def database_backup(self):
+        files = list((self.project / "backups").glob("postgres-*.sql.gz"))
+        self.assertEqual(len(files), 1)
+        with gzip.open(files[0], "rt", encoding="utf-8") as backup:
+            self.assertEqual(backup.read(), SQL)
+        return files[0]
+
+    def test_database_and_volume_share_stamp_and_archive_volume_read_only(self):
+        result = self.run_bash("backup_database")
+        database = self.database_backup()
+        self.assertRegex(database.name, r"^postgres-\d{8}-\d{6}-\d+\.sql\.gz$")
+        stamp = database.name.removeprefix("postgres-").removesuffix(".sql.gz")
+        archive = self.project / "backups" / f"data-{stamp}.tar.gz"
+        self.assertTrue(archive.is_file())
+        self.assertEqual(stat.S_IMODE(database.stat().st_mode), 0o600)
+        self.assertEqual(stat.S_IMODE(database.parent.stat().st_mode), 0o700)
+        self.assertEqual(list(database.parent.glob(".db-*")), [])
+        self.assertEqual(self.compose_calls(), [[
+            "exec", "-T", "postgres", "sh", "-c",
+            'exec pg_dump -U "$POSTGRES_USER" -d "$POSTGRES_DB"',
+        ]])
+        self.assertEqual(self.calls()[1:], [
+            ["docker", "inspect", "SnapOtter", "--format",
+             '{{range .Mounts}}{{if eq .Destination "/data"}}{{.Name}}{{end}}{{end}}'],
+            ["docker", "run", "--rm", "-v", "snapotter_data:/data:ro",
+             "-v", f"{database.parent}:/backup", "alpine:3.22",
+             "tar", "-czf", f"/backup/data-{stamp}.tar.gz", "-C", "/data", "."],
+            ["chown", f"{os.getuid()}:{os.getgid()}", str(archive)],
+        ])
+        self.assertIn(str(database), result.stdout)
+        self.assertIn(str(archive), result.stdout)
+        self.assertEqual(result.stderr, "")
+
+    def test_failed_pg_dump_cleans_partial_file_and_preserves_existing_backups(self):
+        old = self.old_backup()
+        result = self.run_bash("backup_database", env={"DUMP_STATUS": "1"}, expected=1)
+        self.assertIn("Backup PostgreSQL gagal", result.stderr)
+        self.assertEqual(sorted(old.parent.iterdir()), [old])
+        self.assertEqual(len(self.calls()), 1)
+        self.assertEqual(self.compose_calls()[0][:3], ["exec", "-T", "postgres"])
+
+    def test_compression_failure_cleans_partial_file_and_skips_volume_and_pruning(self):
+        old = self.old_backup()
+        result = self.run_bash(r'''
+gzip() { cat >/dev/null; return 1; }
+backup_database
+''', expected=1)
+        self.assertIn("Backup PostgreSQL gagal", result.stderr)
+        self.assertEqual(sorted(old.parent.iterdir()), [old])
+        self.assertEqual(len(self.calls()), 1)
+
+    def test_missing_data_volume_keeps_database_and_still_prunes(self):
+        old = self.old_backup()
+        result = self.run_bash("backup_database", env={"FIXTURE_VOLUME": ""})
+        self.database_backup()
+        self.assertIn("volume /data tidak ditemukan", result.stderr)
+        self.assertFalse(old.exists())
+        self.assertFalse(any(call[:2] == ["docker", "run"] for call in self.calls()))
+        self.assertEqual(list((self.project / "backups").glob("data-*.tar.gz")), [])
+
+    def test_failed_volume_lookup_is_nonfatal_and_preserves_database(self):
+        result = self.run_bash("backup_database", env={"FIXTURE_VOLUME": "", "VOLUME_INSPECT_STATUS": "1"})
+        self.database_backup()
+        self.assertIn("volume /data tidak ditemukan", result.stderr)
+        self.assertEqual(len(self.calls()), 2)
+
+    def test_failed_volume_archive_warns_and_retains_successful_database(self):
+        old = self.old_backup()
+        result = self.run_bash("backup_database", env={"ARCHIVE_STATUS": "1"})
+        self.database_backup()
+        self.assertIn("backup volume /data gagal", result.stderr)
+        self.assertFalse(old.exists())
+        self.assertFalse(any(call[0] == "chown" for call in self.calls()))
+        self.assertEqual(list((self.project / "backups").glob("data-*.tar.gz")), [])
+
+    def test_ownership_adjustment_failure_does_not_discard_successful_backups(self):
+        result = self.run_bash("backup_database", env={"CHOWN_STATUS": "1"})
+        database = self.database_backup()
+        self.assertEqual(len(list(database.parent.glob("data-*.tar.gz"))), 1)
+        self.assertIn("Backup volume /data:", result.stdout)
+        self.assertNotIn("backup volume /data gagal", result.stderr)
+
+
+class BackupRetentionTests(BashFunctionTestCase):
+    def assert_retention(self, env, days):
+        expired_db = self.old_backup("postgres-expired.sql.gz", days=days + 1.5)
+        expired_data = self.old_backup("data-expired.tar.gz", days=days + 1.5)
+        # find -mtime +N compares whole days: N days and 12 hours is retained.
+        boundary_db = self.old_backup("postgres-boundary.sql.gz", days=days + 0.5)
+        boundary_data = self.old_backup("data-boundary.tar.gz", days=days + 0.5)
+        recent = self.old_backup("postgres-recent.sql.gz", days=0)
+        result = self.run_bash("prune_backup", env=env)
+        for expired in (expired_db, expired_data):
+            self.assertFalse(expired.exists())
+            self.assertIn(str(expired), result.stdout)
+        for kept in (boundary_db, boundary_data, recent):
+            self.assertTrue(kept.exists())
+            self.assertNotIn(str(kept), result.stdout)
+        self.assertIn(f"(>{days} hari)", result.stdout)
+
+    def test_default_retention_is_fourteen_days_with_whole_day_boundary(self):
+        self.assert_retention({}, 14)
+
+    def test_empty_environment_value_uses_default_retention(self):
+        self.assert_retention({"BACKUP_RETENSI_HARI": ""}, 14)
+
+    def test_custom_retention_keeps_backups_younger_than_override(self):
+        kept = self.old_backup("postgres-fifteen-days.sql.gz", days=15)
+        self.assert_retention({"BACKUP_RETENSI_HARI": "30"}, 30)
+        self.assertTrue(kept.exists())
+
+    def test_zero_day_override_is_respected(self):
+        self.assert_retention({"BACKUP_RETENSI_HARI": "0"}, 0)
+
+    def test_pruning_preserves_unrelated_files_subdirectories_and_symlinks(self):
+        protected = [self.old_backup(name) for name in (
+            "manual.dump", "postgres.sql.gz", "data.tar.gz", ".db-incomplete",
+            "postgres-expired.sql.gz.bak", "data-expired.tar.gz.bak",
+        )]
+        backups = self.project / "backups"
+        nested = backups / "nested"
+        nested.mkdir()
+        nested_backup = nested / "postgres-expired.sql.gz"
+        nested_backup.write_bytes(b"nested sentinel")
+        matching_directory = backups / "data-directory.tar.gz"
+        matching_directory.mkdir()
+        external = self.sandbox / "postgres-external.sql.gz"
+        external.write_bytes(b"external sentinel")
+        symlink = backups / "postgres-link.sql.gz"
+        symlink.symlink_to(external)
+        old_time = time.time() - 40 * DAY
+        for path in (nested_backup, matching_directory, external):
+            os.utime(path, (old_time, old_time))
+        os.utime(symlink, (old_time, old_time), follow_symlinks=False)
+        expired = self.old_backup()
+        self.run_bash("prune_backup")
+        self.assertFalse(expired.exists())
+        for path in protected + [nested_backup, matching_directory]:
+            self.assertTrue(path.exists(), str(path))
+        self.assertTrue(symlink.is_symlink())
+        self.assertEqual(external.read_bytes(), b"external sentinel")
+        self.assertEqual(nested_backup.read_bytes(), b"nested sentinel")
+
+    def test_no_expired_files_produces_no_deletion_message(self):
+        recent = self.old_backup(days=0)
+        result = self.run_bash("prune_backup")
+        self.assertTrue(recent.exists())
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(result.stderr, "")
+
+    def test_unavailable_backup_directory_is_nonfatal(self):
+        result = self.run_bash("prune_backup")
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(result.stderr, "")
+
+    def test_invalid_retention_is_nonfatal_and_preserves_backups(self):
+        old = self.old_backup()
+        for retention in ("not-a-number", "14 -delete"):
+            with self.subTest(retention=retention):
+                result = self.run_bash("prune_backup", env={"BACKUP_RETENSI_HARI": retention})
+                self.assertTrue(old.exists())
+                self.assertEqual(result.stdout, "")
+                self.assertEqual(result.stderr, "")
+
+
+class HelpTests(BashFunctionTestCase):
+    def test_help_describes_new_backup_scope_retention_and_host_hardening(self):
+        result = self.run_bash("bantuan")
+        for text in ("volume /data", "BACKUP_RETENSI_HARI", "default 14 hari", "swapfile 2 GB", "firewall UFW"):
+            with self.subTest(text=text):
+                self.assertIn(text, result.stdout)
+        self.assertEqual(self.calls(), [])
+
+
+class GitignoreTests(unittest.TestCase):
+    def check_ignore(self, paths, expected):
         result = subprocess.run(
-            ["git", "-c", "core.excludesFile=/dev/null", "check-ignore", "--no-index", "--stdin"],
-            input="\n".join(paths) + "\n", text=True, capture_output=True,
-            cwd=REPOSITORY, timeout=5, check=False,
+            ["git", "check-ignore", "--no-index", "--stdin", "-z"],
+            cwd=ROOT,
+            input="\0".join(paths) + "\0",
+            capture_output=True,
+            text=True,
+            timeout=3,
+            check=False,
+            env={"PATH": os.defpath, "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": os.devnull},
         )
-        self.assertEqual(result.returncode, status, result.stderr)
-        return result.stdout.splitlines()
+        self.assertEqual(result.returncode, expected, result.stderr)
+        return result.stdout.split("\0")[:-1]
 
-    def test_generated_state_secrets_and_backups_are_ignored(self):
+    def test_credentials_deployment_state_and_backup_artifacts_are_ignored(self):
         paths = [
-            ".env", ".domain", ".compose.sha256", ".image-digest.lock",
-            "backups/private-file", "postgres-fixture.sql.gz", "database.dump",
-            "data-fixture.tar.gz", "compose.minimum.yml", "docker-compose.yml",
+            ".env", ".domain", ".image-digest.lock", ".compose.sha256",
+            "docker-compose.yml", "compose.minimum.yml", "backups/private.txt",
+            "postgres-example.sql.gz", "manual.dump", "data-example.tar.gz",
         ]
         self.assertEqual(self.check_ignore(paths, 0), paths)
 
-    def test_script_documentation_and_test_sources_remain_visible_to_git(self):
+    def test_source_documentation_and_tests_remain_visible_to_git(self):
         self.assertEqual(self.check_ignore([
             "otomatisasi_snapotter.sh", "README.md", "tests/test_otomatisasi_snapotter.py",
         ], 1), [])
