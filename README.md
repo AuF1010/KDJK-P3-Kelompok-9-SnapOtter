@@ -84,8 +84,8 @@ SnapOtter dipasang pada layanan VPS dengan spesifikasi berikut.
 | RAM | 2 GB |
 | Storage | 40 GB |
 | Traffic | 512 GB |
-| Docker Engine | 29.9.2 |
-| Docker Compose | 5.6.1 |
+| Docker Engine | Versi stabil terbaru dari repo resmi Docker (cek: `docker --version`) |
+| Docker Compose | Plugin Compose v2 (cek: `docker compose version`) |
 | Versi SnapOtter | 2.2.0 |
 | Domain | `snapotterlab.web.id` |
 
@@ -362,6 +362,52 @@ Hasil pengujian kelompok menunjukkan **HTTP/2**, **HTTP 200**, dan status aplika
 > ![Pengujian HTTPS dan health API SnapOtter](screenshots/05-https-healthcheck.png)
 
 
+### 3. Hardening Server (SSH, Firewall, Swap)
+
+Langkah berikut mengurangi permukaan serangan server. Pada instalasi otomatis, **swapfile dan UFW sudah dikonfigurasi oleh skrip** `otomatisasi_snapotter.sh`; langkah di bawah ditujukan untuk instalasi manual atau verifikasi.
+
+**a. Firewall (UFW).** Aplikasi hanya terikat ke `127.0.0.1:1349`, tetapi host tetap perlu firewall agar hanya SSH, HTTP, dan HTTPS yang terbuka.
+
+```bash
+sudo apt install -y ufw
+sudo ufw allow OpenSSH
+sudo ufw allow 80/tcp
+sudo ufw allow 443/tcp
+sudo ufw default deny incoming
+sudo ufw default allow outgoing
+sudo ufw --force enable
+sudo ufw status verbose
+```
+
+> Izinkan `OpenSSH` **sebelum** `ufw enable` agar sesi SSH tidak terputus. Bila SSH memakai port non-standar, tambahkan `sudo ufw allow <port>/tcp`.
+
+**b. Swapfile 2 GB.** Dengan RAM 2 GB dan batas memori container yang berjumlah ~1,6 GB, sisa untuk OS sangat tipis. Swapfile mencegah OOM-kill saat beban memuncak.
+
+```bash
+sudo fallocate -l 2G /swapfile
+sudo chmod 600 /swapfile
+sudo mkswap /swapfile
+sudo swapon /swapfile
+echo '/swapfile none swap sw 0 0' | sudo tee -a /etc/fstab
+```
+
+**c. Pengamanan SSH.** Gunakan autentikasi kunci dan matikan login password serta login root langsung. Pada `/etc/ssh/sshd_config` (atau file di `/etc/ssh/sshd_config.d/`):
+
+```
+PasswordAuthentication no
+PermitRootLogin no
+```
+
+Terapkan, lalu pasang `fail2ban` untuk memblokir percobaan brute-force:
+
+```bash
+sudo systemctl reload ssh
+sudo apt install -y fail2ban
+```
+
+> Pastikan kunci publik SSH sudah terpasang (`~/.ssh/authorized_keys`) **sebelum** mematikan `PasswordAuthentication`, agar tidak terkunci dari server.
+
+
 ## Maintenance
 
 [`^ kembali ke atas ^`](#top)
@@ -416,7 +462,17 @@ Note : Restart sebaiknya dilakukan ketika tidak ada file yang sedang diproses ag
 
 SnapOtter menggunakan PostgreSQL untuk menyimpan data seperti akun pengguna, pengaturan, dan pipeline. Selain database, file pengguna juga disimpan pada volume Docker.
 
-Untuk membuat backup database PostgreSQL:
+**Cara termudah** adalah dengan skrip otomatisasi, yang mencadangkan **database PostgreSQL dan volume `/data`** sekaligus, lalu menghapus backup yang lebih lama dari masa retensi (default 14 hari):
+
+```bash
+bash otomatisasi_snapotter.sh backup-db
+# retensi khusus, mis. 30 hari:
+BACKUP_RETENSI_HARI=30 bash otomatisasi_snapotter.sh backup-db
+```
+
+Backup tersimpan di `~/snapotter/backups` sebagai `postgres-<stamp>.sql.gz` (database) dan `data-<stamp>.tar.gz` (file pengguna).
+
+Secara manual, backup database dalam format SQL terkompresi:
 
 ```bash
 cd ~/snapotter
@@ -424,32 +480,53 @@ umask 077
 mkdir -p backups
 
 sudo docker exec SnapOtter-postgres \
-  sh -c 'pg_dump -Fc -U "$POSTGRES_USER" -d "$POSTGRES_DB"' \
-  > "backups/snapotter-db-$(date +%Y%m%d-%H%M%S).dump"
+  sh -c 'exec pg_dump -U "$POSTGRES_USER" -d "$POSTGRES_DB"' \
+  | gzip -c > "backups/postgres-$(date +%Y%m%d-%H%M%S).sql.gz"
 ```
 
-Hasil backup database akan disimpan pada folder `~/snapotter/backups`.
-
-Untuk mencadangkan file aplikasi, cari terlebih dahulu nama volume yang digunakan SnapOtter:
+Untuk mencadangkan file aplikasi, cari dahulu nama volume `/data`, lalu arsipkan:
 
 ```bash
 DATA_VOLUME="$(sudo docker inspect SnapOtter \
   --format '{{range .Mounts}}{{if eq .Destination "/data"}}{{.Name}}{{end}}{{end}}')"
 
-echo "$DATA_VOLUME"
-```
-
-Setelah nama volume ditemukan, buat arsip backup menggunakan perintah berikut:
-
-```bash
 sudo docker run --rm \
   -v "$DATA_VOLUME:/data:ro" \
   -v "$HOME/snapotter/backups:/backup" \
   alpine:3.22 \
-  tar -czf /backup/snapotter-data.tar.gz -C /data .
+  tar -czf "/backup/data-$(date +%Y%m%d-%H%M%S).tar.gz" -C /data .
 ```
 
-Note : Backup sebaiknya dilakukan ketika tidak ada proses pengolahan file yang aktif.
+Note : Backup sebaiknya dilakukan ketika tidak ada proses pengolahan file yang aktif. Simpan salinan backup di luar VPS (mis. unduh via `scp`) agar tetap aman bila server bermasalah.
+
+### 4a. Memulihkan (restore) data
+
+> **Peringatan:** restore menimpa data yang ada. Hentikan aplikasi dan pastikan backup benar sebelum melanjutkan.
+
+**Restore database** dari `postgres-<stamp>.sql.gz`:
+
+```bash
+cd ~/snapotter
+gunzip -c backups/postgres-<stamp>.sql.gz \
+  | sudo docker exec -i SnapOtter-postgres \
+      sh -c 'exec psql -U "$POSTGRES_USER" -d "$POSTGRES_DB"'
+```
+
+**Restore file** dari `data-<stamp>.tar.gz` ke volume `/data` (aplikasi dalam keadaan berhenti):
+
+```bash
+sudo docker compose -f docker-compose.yml -f compose.minimum.yml stop SnapOtter
+DATA_VOLUME="$(sudo docker inspect SnapOtter \
+  --format '{{range .Mounts}}{{if eq .Destination "/data"}}{{.Name}}{{end}}{{end}}')"
+
+sudo docker run --rm \
+  -v "$DATA_VOLUME:/data" \
+  -v "$HOME/snapotter/backups:/backup:ro" \
+  alpine:3.22 \
+  sh -c 'rm -rf /data/* /data/..?* 2>/dev/null; tar -xzf /backup/data-<stamp>.tar.gz -C /data'
+
+sudo docker compose -f docker-compose.yml -f compose.minimum.yml start SnapOtter
+```
 
 ### 5. Memeriksa akses HTTPS
 
@@ -491,6 +568,13 @@ Setelah pembaruan selesai, periksa kembali status container dan pastikan aplikas
 Selain instalasi secara manual, `otomatisasi_snapotter.sh` juga dibuat untuk mempermudah instalasi dan pengelolaan SnapOtter pada VPS Ubuntu 24.04.
 
 Skrip ini mengotomatisasi pemasangan Docker, pengunduhan berkas konfigurasi SnapOtter, pembuatan password, penyesuaian sumber daya VPS, menjalankan container, serta konfigurasi Caddy untuk akses HTTPS.
+
+Selain itu, skrip juga menerapkan beberapa langkah hardening dan keandalan:
+
+- **Swapfile 2 GB** dibuat otomatis agar VPS 2 GB tidak mudah terkena OOM-kill.
+- **Firewall UFW** dikonfigurasi (izinkan SSH, HTTP, HTTPS; tolak sisanya).
+- **Verifikasi integritas** `docker-compose.yml` (checksum SHA-256) dan **penguncian digest image** (TOFU) untuk menahan perubahan tak terduga pada rantai pasok.
+- **Backup** kini mencakup database **dan** volume `/data`, dengan **retensi otomatis** (default 14 hari).
 
 Berkas skrip dapat dilihat pada [otomatisasi_snapotter.sh](otomatisasi_snapotter.sh).
 

@@ -10,10 +10,15 @@ VERSI='2.2.0'
 DOMAIN_DEFAULT='snapotterlab.web.id'
 COMPOSE=(sudo docker compose --project-directory "$PROYEK" --env-file "$PROYEK/.env" \
   -f "$PROYEK/docker-compose.yml" -f "$PROYEK/compose.minimum.yml")
+# Referensi image utama (harus sama dengan image pada compose.minimum.yml).
+IMAGE="snapotter/snapotter:$VERSI"
+# Retensi backup dalam hari; dapat ditimpa via environment.
+BACKUP_RETENSI_HARI="${BACKUP_RETENSI_HARI:-14}"
 
 info() { printf '\n==> %s\n' "$*"; }
 gagal() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 
+# Print command usage, installation prerequisites, and backup retention options.
 bantuan() {
   cat <<'PANDUAN'
 Penggunaan:
@@ -23,7 +28,13 @@ Penggunaan:
   bash otomatisasi_snapotter.sh cek            Periksa API lokal dan HTTPS
   bash otomatisasi_snapotter.sh restart        Restart aplikasi SnapOtter
   bash otomatisasi_snapotter.sh log            Tampilkan 50 baris log aplikasi
-  bash otomatisasi_snapotter.sh backup-db      Backup database PostgreSQL
+  bash otomatisasi_snapotter.sh backup-db      Backup DB PostgreSQL + volume /data
+
+Perintah 'instal' juga menyiapkan swapfile 2 GB dan firewall UFW
+(mengizinkan SSH, HTTP, HTTPS; menolak sisanya).
+
+Retensi backup diatur lewat environment BACKUP_RETENSI_HARI (default 14 hari),
+mis.: BACKUP_RETENSI_HARI=30 bash otomatisasi_snapotter.sh backup-db
 
 Contoh instalasi di VPS baru:
   bash otomatisasi_snapotter.sh instal snapotterlab.web.id
@@ -39,12 +50,27 @@ periksa_pengguna() {
   command -v sudo >/dev/null 2>&1 || gagal "Perintah sudo tidak tersedia."
 }
 
+# Check required project files, Docker Compose availability, and the saved checksum.
+# Missing files or Docker, a Compose failure, or a checksum failure abort the script.
 periksa_proyek() {
   for berkas in docker-compose.yml compose.minimum.yml .env; do
     [[ -f "$PROYEK/$berkas" ]] || gagal "Berkas $PROYEK/$berkas tidak ditemukan."
   done
   command -v docker >/dev/null 2>&1 || gagal "Docker belum terpasang."
   sudo docker compose version >/dev/null
+  verifikasi_compose
+}
+
+# Compare docker-compose.yml with its saved SHA-256 checksum (trust on first use).
+# Return successfully if no checksum file exists; a mismatch exits the script with
+# status 1. Checksum read or calculation failures also abort the script.
+verifikasi_compose() {
+  [[ -f "$PROYEK/.compose.sha256" ]] || return 0   # instalasi lama: lewati
+  local tersimpan sekarang
+  tersimpan="$(cat "$PROYEK/.compose.sha256")"
+  sekarang="$(sha256sum "$PROYEK/docker-compose.yml" | awk '{print $1}')"
+  [[ "$tersimpan" == "$sekarang" ]] || gagal \
+    'Checksum docker-compose.yml tidak cocok (berpotensi diubah). Hapus .compose.sha256 bila perubahan ini memang disengaja.'
 }
 
 baca_domain() {
@@ -96,11 +122,19 @@ APT
   info 'Docker berhasil dipasang dan diuji menggunakan hello-world.'
 }
 
+# Create or overwrite project configuration for the domain in $1, including
+# generated credentials, the Compose checksum, and resource limits for a 2 GB VPS.
+# Set umask to 077; download, file creation, or Compose validation failures abort
+# the script. The caller must validate the domain and guard against overwrites.
 buat_konfigurasi() {
   info '2/7 Membuat direktori dan mengunduh Compose resmi SnapOtter'
   install -d -m 700 "$PROYEK"
   curl --proto '=https' --tlsv1.2 -fsSLo "$PROYEK/docker-compose.yml" \
     "https://raw.githubusercontent.com/snapotter-hq/SnapOtter/v${VERSI}/docker/docker-compose.yml"
+  # Catat checksum compose resmi untuk verifikasi integritas pada perintah berikutnya.
+  umask 077
+  sha256sum "$PROYEK/docker-compose.yml" | awk '{print $1}' > "$PROYEK/.compose.sha256"
+  chmod 600 "$PROYEK/.compose.sha256"
 
   info '3/7 Membuat password acak dan file .env (mode 600)'
   umask 077
@@ -152,12 +186,41 @@ YAML
   info 'Konfigurasi Docker Compose valid.'
 }
 
+# Verify and validate Compose, pull images, and start containers in the background.
+# Checksum or Compose failures abort the script; digest changes only warn and do
+# not prevent startup.
 jalankan_container() {
   info '5/7 Mengunduh image dan menjalankan container'
+  verifikasi_compose
   "${COMPOSE[@]}" config --quiet
   "${COMPOSE[@]}" pull
+  kunci_digest_image
   "${COMPOSE[@]}" up -d --no-build
   "${COMPOSE[@]}" ps
+}
+
+# Save the first available repository digest for IMAGE in .image-digest.lock
+# (mode 600), setting umask to 077 when creating it. An unreadable or missing
+# image digest is skipped successfully; a changed digest only warns, leaving
+# the saved value unchanged. Lock creation or chmod failures abort the script.
+kunci_digest_image() {
+  local lock="$PROYEK/.image-digest.lock" digest
+  digest="$(sudo docker image inspect \
+    --format '{{range .RepoDigests}}{{println .}}{{end}}' "$IMAGE" 2>/dev/null \
+    | head -n1)" || true
+  [[ -n "$digest" ]] || { echo 'Peringatan: digest image tidak terbaca, penguncian dilewati.' >&2; return 0; }
+  if [[ -f "$lock" ]]; then
+    if [[ "$(cat "$lock")" != "$digest" ]]; then
+      printf 'PERINGATAN: digest image berubah.\n  lama : %s\n  baru : %s\n' \
+        "$(cat "$lock")" "$digest" >&2
+      echo 'Perbarui .image-digest.lock bila pembaruan ini memang disengaja.' >&2
+    fi
+  else
+    umask 077
+    printf '%s\n' "$digest" > "$lock"
+    chmod 600 "$lock"
+    info "Digest image dikunci: $digest"
+  fi
 }
 
 konfigurasi_caddy() {
@@ -200,6 +263,46 @@ CADDY
   info 'Caddy terkonfigurasi dengan HTTP/1.1, HTTP/2, dan HTTPS otomatis.'
 }
 
+# Create and activate a 2 GiB /swapfile (mode 600), adding its /etc/fstab entry
+# if absent. Skip successfully if swap is active or /swapfile already exists.
+# Allocation falls back to dd; unrecovered setup failures abort the script.
+konfigurasi_swap() {
+  info 'Menyiapkan swapfile 2 GB untuk VPS RAM 2 GB'
+  if sudo swapon --show 2>/dev/null | grep -q .; then
+    info 'Swap sudah aktif, pembuatan dilewati.'
+    return 0
+  fi
+  if [[ -e /swapfile ]]; then
+    info '/swapfile sudah ada, pembuatan dilewati.'
+    return 0
+  fi
+  sudo fallocate -l 2G /swapfile || sudo dd if=/dev/zero of=/swapfile bs=1M count=2048
+  sudo chmod 600 /swapfile
+  sudo mkswap /swapfile
+  sudo swapon /swapfile
+  if ! grep -q '^/swapfile[[:space:]]' /etc/fstab; then
+    echo '/swapfile none swap sw 0 0' | sudo tee -a /etc/fstab >/dev/null
+  fi
+  info 'Swapfile 2 GB aktif dan terdaftar di /etc/fstab.'
+}
+
+# Install and enable UFW, allowing OpenSSH and TCP ports 80/443, with default
+# incoming deny and outgoing allow policies. Existing rules are retained; custom
+# SSH ports require a separate rule. Command failures abort the script.
+konfigurasi_firewall() {
+  info 'Mengonfigurasi firewall UFW (izinkan SSH, HTTP, HTTPS; tolak sisanya)'
+  sudo apt-get install -y ufw
+  # Izinkan SSH SEBELUM mengaktifkan UFW agar sesi tidak terputus.
+  sudo ufw allow OpenSSH
+  sudo ufw allow 80/tcp
+  sudo ufw allow 443/tcp
+  sudo ufw default deny incoming
+  sudo ufw default allow outgoing
+  sudo ufw --force enable
+  sudo ufw status verbose
+  echo 'Catatan: bila SSH memakai port non-standar, tambahkan "sudo ufw allow <port>/tcp" sebelum menutup sesi.'
+}
+
 coba_api() {
   local alamat="$1" keterangan="$2" nomor
   for nomor in $(seq 1 30); do
@@ -231,24 +334,73 @@ cek_layanan() {
   echo
 }
 
+# Save a timestamp-and-PID-named gzip SQL dump under PROYEK/backups, then attempt
+# a matching /data volume archive and apply retention. Set umask to 077. Directory
+# or file failures abort the script; dump/compression failure removes the temporary
+# dump and exits with status 1. Volume backup and pruning errors are tolerated.
 backup_database() {
   umask 077
   install -d -m 700 "$PROYEK/backups"
-  local tujuan sementara
-  tujuan="$PROYEK/backups/postgres-$(date +%Y%m%d-%H%M%S)-$$.sql.gz"
+  local stamp tujuan sementara
+  stamp="$(date +%Y%m%d-%H%M%S)-$$"
+  tujuan="$PROYEK/backups/postgres-$stamp.sql.gz"
   sementara="$(mktemp "$PROYEK/backups/.db-XXXXXX")"
   if "${COMPOSE[@]}" exec -T postgres sh -c \
        'exec pg_dump -U "$POSTGRES_USER" -d "$POSTGRES_DB"' \
        | gzip -c > "$sementara"; then
     mv -- "$sementara" "$tujuan"
     printf 'Backup PostgreSQL: %s\n' "$tujuan"
-    echo 'Catatan: backup ini tidak mencakup file yang disimpan di volume SnapOtter.'
   else
     rm -f -- "$sementara"
     gagal 'Backup PostgreSQL gagal.'
   fi
+  backup_volume "$stamp"
+  prune_backup
 }
 
+# Archive SnapOtter's named /data volume to PROYEK/backups/data-$1.tar.gz, where
+# $1 is the database backup's timestamp-and-PID suffix and backups must exist.
+# A missing volume or failed archive only warns; a failed archive may leave a
+# partial file. Attempt to give the caller ownership, ignoring chown failures.
+backup_volume() {
+  local stamp="$1" nama_volume tujuan
+  nama_volume="$(sudo docker inspect SnapOtter \
+    --format '{{range .Mounts}}{{if eq .Destination "/data"}}{{.Name}}{{end}}{{end}}' 2>/dev/null)" || true
+  if [[ -z "$nama_volume" ]]; then
+    echo 'Peringatan: volume /data tidak ditemukan, backup file dilewati.' >&2
+    return 0
+  fi
+  tujuan="$PROYEK/backups/data-$stamp.tar.gz"
+  if sudo docker run --rm \
+       -v "$nama_volume:/data:ro" \
+       -v "$PROYEK/backups:/backup" \
+       alpine:3.22 \
+       tar -czf "/backup/data-$stamp.tar.gz" -C /data . ; then
+    sudo chown "$(id -u):$(id -g)" "$tujuan" 2>/dev/null || true
+    printf 'Backup volume /data: %s\n' "$tujuan"
+  else
+    echo 'Peringatan: backup volume /data gagal.' >&2
+  fi
+}
+
+# Delete regular postgres-*.sql.gz and data-*.tar.gz files directly in backups
+# whose age, rounded down to whole 24-hour periods, exceeds BACKUP_RETENSI_HARI
+# (default 14). Suppress and ignore find errors, including invalid retention.
+prune_backup() {
+  local dihapus
+  dihapus="$(find "$PROYEK/backups" -maxdepth 1 -type f \
+    \( -name 'postgres-*.sql.gz' -o -name 'data-*.tar.gz' \) \
+    -mtime +"$BACKUP_RETENSI_HARI" -print -delete 2>/dev/null)" || true
+  if [[ -n "$dihapus" ]]; then
+    printf 'Backup lama dihapus (>%s hari):\n%s\n' "$BACKUP_RETENSI_HARI" "$dihapus"
+  fi
+}
+
+# Install SnapOtter for the bare domain in $1 on a fresh Ubuntu 24.04 VPS.
+# Reject missing/invalid domains, existing project configuration or Caddy, and a
+# Docker repository configured without Docker. Configure swap, Docker, project
+# files, containers, UFW, and Caddy. Validation, unrecovered setup failures, or
+# failed health checks abort the script; completed system changes are not rolled back.
 instal_baru() {
   local domain="${1:-}"
   [[ -n "$domain" ]] || gagal 'Isi domain, contoh: instal snapotterlab.web.id'
@@ -273,9 +425,11 @@ instal_baru() {
   info 'Memulai instalasi SnapOtter pada VPS baru.'
   echo 'Sebelum melanjutkan, pastikan DNS A record dan port TCP 80/443 sudah disiapkan.'
   sudo -v
+  konfigurasi_swap
   instal_docker
   buat_konfigurasi "$domain"
   jalankan_container
+  konfigurasi_firewall
   konfigurasi_caddy "$domain"
 
   info '7/7 Memeriksa layanan lokal dan HTTPS'
